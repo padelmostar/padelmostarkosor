@@ -6,6 +6,12 @@
 <title>PadelMostar — Book Your Court</title>
 <meta name="description" content="Book your padel court at PadelMostar, Kosor 327, Blagaj near Mostar. Professional Padel Technologies court.">
 <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script>
+  const SUPABASE_URL = 'https://wzxgvupaqwkqlrohgfkh.supabase.co';
+  const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind6eGd2dXBhcXdrcWxyb2hnZmtoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4MzkyODYsImV4cCI6MjA5MzQxNTI4Nn0.cWO6zX6KuNDW1SOxAupI-vC3conFTvOSDoVwSJze6Bo';
+  const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+</script>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -839,47 +845,69 @@ calMonth_ = 4; // May
 // Booked slots: key = "YYYY-MM-DD|HH:MM", value = duration hours
 // In a real backend this would come from a database
 // Here we persist in localStorage so bookings survive page refresh
-// ── BOOKED SLOTS ──
-// Stored in localStorage per browser
-let bookedSlotsCache = null; // loaded once on page load
+// ── BOOKED SLOTS — Supabase backend (cross-device sync) ──
+let bookedSlotsCache = {}; // { 'YYYY-MM-DD|HH:MM': true }
 
 function getLocalBooked() {
   try { return JSON.parse(localStorage.getItem('padel_booked') || '{}'); } catch(e) { return {}; }
 }
 
-function addBookedSlot(dateStr, time, dur) {
-  // Write to localStorage immediately (optimistic)
+function getBookedSlots() {
+  return Object.assign({}, getLocalBooked(), bookedSlotsCache);
+}
+
+function isSlotBooked(dateStr, time) {
+  return !!getBookedSlots()[dateStr + '|' + time];
+}
+
+function addBookedSlotLocal(dateStr, time, dur) {
+  // Optimistic local update while Supabase write completes
   const booked = getLocalBooked();
   const [h] = time.split(':').map(Number);
   for (let i = 0; i < dur; i++) {
     const slotHour = String(h + i).padStart(2,'0') + ':00';
     booked[dateStr + '|' + slotHour] = true;
+    bookedSlotsCache[dateStr + '|' + slotHour] = true;
   }
   localStorage.setItem('padel_booked', JSON.stringify(booked));
-  // Invalidate cache so next render re-merges
-  if (bookedSlotsCache) {
-    for (let i = 0; i < dur; i++) {
-      const slotHour = String(h + i).padStart(2,'0') + ':00';
-      bookedSlotsCache[dateStr + '|' + slotHour] = true;
-    }
+}
+
+async function addBookedSlot(dateStr, time, dur) {
+  // Write to local immediately
+  addBookedSlotLocal(dateStr, time, dur);
+  // Write to Supabase (cross-device)
+  try {
+    await supabase.from('bookings').insert({
+      date_key:   dateStr,
+      time_slot:  time,
+      duration:   dur
+    });
+  } catch(e) {
+    console.warn('Supabase insert error:', e);
   }
 }
 
-function isSlotBooked(dateStr, time) {
-  const merged = Object.assign({}, getLocalBooked(), bookedSlotsCache || {});
-  return !!merged[dateStr + '|' + time];
-}
-
-function getBookedSlots() {
-  return Object.assign({}, getLocalBooked(), bookedSlotsCache || {});
-}
-
-// Load bookings — uses localStorage (cross-device via shared browser storage)
-// Note: GitHub Pages is static, no server API. Bookings persist per browser.
-// For true cross-device sync, upgrade to a backend later.
 async function loadBookingsFromNetlify() {
-  // No-op on GitHub Pages — localStorage handles local persistence
-  // bookedSlotsCache stays null, getBookedSlots() falls back to localStorage
+  // Load all bookings from Supabase
+  try {
+    const { data, error } = await supabase
+      .from('bookings')
+      .select('date_key, time_slot, duration');
+    if (error || !data) return;
+    const slots = {};
+    data.forEach(row => {
+      const h = parseInt(row.time_slot.split(':')[0]);
+      for (let i = 0; i < row.duration; i++) {
+        const slotHour = String(h + i).padStart(2,'0') + ':00';
+        slots[row.date_key + '|' + slotHour] = true;
+      }
+    });
+    bookedSlotsCache = slots;
+    renderCalendar();
+    renderTimeSlots();
+  } catch(e) {
+    console.warn('Supabase load error:', e);
+  }
 }
 
 const UNAVAIL_TIMES = [];
@@ -1182,7 +1210,7 @@ async function submitBooking() {
   }
 
   // Mark slot as booked locally
-  addBookedSlot(dateKey, selectedTime, selectedDur);
+  await addBookedSlot(dateKey, selectedTime, selectedDur);
 
   // Store booking name/phone for calendar display
   const namesStore = JSON.parse(localStorage.getItem('padel_names') || '{}');
