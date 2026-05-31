@@ -838,77 +838,95 @@ let calYear, calMonth_, selectedDate = null, selectedTime = null, selectedDur = 
 const OPEN_DATE = new Date(2026, 4, 10); // month is 0-indexed
 OPEN_DATE.setHours(0,0,0,0);
 
-// Start calendar on May 2026
-calYear = 2026;
-calMonth_ = 4; // May
-
-// Booked slots: key = "YYYY-MM-DD|HH:MM", value = duration hours
-// In a real backend this would come from a database
-// Here we persist in localStorage so bookings survive page refresh
-// ── BOOKED SLOTS — Supabase backend (cross-device sync) ──
-let bookedSlotsCache = {}; // { 'YYYY-MM-DD|HH:MM': true }
-
-function getLocalBooked() {
-  try { return JSON.parse(localStorage.getItem('padel_booked') || '{}'); } catch(e) { return {}; }
+// Local-date helper — avoids the UTC off-by-one from toISOString()
+function fmtDate(d) {
+  return d.getFullYear() + '-' +
+         String(d.getMonth() + 1).padStart(2, '0') + '-' +
+         String(d.getDate()).padStart(2, '0');
 }
 
+// Earliest bookable day = the later of "today" and the opening date.
+// Recomputed live so the past is never bookable as days pass.
+function minBookableDate() {
+  const today = new Date(); today.setHours(0,0,0,0);
+  return today > OPEN_DATE ? today : OPEN_DATE;
+}
+
+// Start calendar on the current month
+{
+  const now = new Date();
+  calYear = now.getFullYear();
+  calMonth_ = now.getMonth();
+}
+
+// ── BOOKED SLOTS — Supabase is the single source of truth ──
+// key = "YYYY-MM-DD|HH:MM"  →  true
+// Supabase holds the real bookings shared across every device. We DO NOT keep
+// a separate localStorage copy of booked slots, because a device-local copy can
+// show a slot as "booked" even when the write to Supabase actually failed —
+// which is exactly what made bookings look saved on the Mac but not the iPhone.
+let bookedSlotsCache = {};
+
 function getBookedSlots() {
-  return Object.assign({}, getLocalBooked(), bookedSlotsCache);
+  return bookedSlotsCache;
 }
 
 function isSlotBooked(dateStr, time) {
-  return !!getBookedSlots()[dateStr + '|' + time];
+  return !!bookedSlotsCache[dateStr + '|' + time];
 }
 
-function addBookedSlotLocal(dateStr, time, dur) {
-  // Optimistic local update while Supabase write completes
-  const booked = getLocalBooked();
+// Write a confirmed booking to Supabase. Returns true only if it really saved.
+async function addBookedSlot(dateStr, time, dur) {
+  const { error } = await supabase.from('bookings').insert({
+    date_key:  dateStr,
+    time_slot: time,
+    duration:  dur
+  });
+  if (error) {
+    console.error('Supabase insert error:', error);
+    return false;          // caller must NOT show a confirmation
+  }
+  // Reflect immediately in the local cache so the UI updates at once
   const [h] = time.split(':').map(Number);
   for (let i = 0; i < dur; i++) {
-    const slotHour = String(h + i).padStart(2,'0') + ':00';
-    booked[dateStr + '|' + slotHour] = true;
+    const slotHour = String(h + i).padStart(2, '0') + ':00';
     bookedSlotsCache[dateStr + '|' + slotHour] = true;
   }
-  localStorage.setItem('padel_booked', JSON.stringify(booked));
+  return true;
 }
 
-async function addBookedSlot(dateStr, time, dur) {
-  // Write to local immediately
-  addBookedSlotLocal(dateStr, time, dur);
-  // Write to Supabase (cross-device)
-  try {
-    await supabase.from('bookings').insert({
-      date_key:   dateStr,
-      time_slot:  time,
-      duration:   dur
-    });
-  } catch(e) {
-    console.warn('Supabase insert error:', e);
-  }
-}
-
-async function loadBookingsFromNetlify() {
-  // Load all bookings from Supabase
+async function loadBookings() {
+  // Load all bookings from Supabase — this is what every device reads
   try {
     const { data, error } = await supabase
       .from('bookings')
       .select('date_key, time_slot, duration');
-    if (error || !data) return;
+    if (error) { console.error('Supabase load error:', error); return; }
+    if (!data) return;
     const slots = {};
     data.forEach(row => {
       const h = parseInt(row.time_slot.split(':')[0]);
       for (let i = 0; i < row.duration; i++) {
-        const slotHour = String(h + i).padStart(2,'0') + ':00';
+        const slotHour = String(h + i).padStart(2, '0') + ':00';
         slots[row.date_key + '|' + slotHour] = true;
       }
     });
-    bookedSlotsCache = slots;
+    bookedSlotsCache = slots;   // full replace — never stale phantom slots
     renderCalendar();
     renderTimeSlots();
   } catch(e) {
-    console.warn('Supabase load error:', e);
+    console.error('Supabase load error:', e);
   }
 }
+// Back-compat alias (the old name is still called elsewhere)
+const loadBookingsFromNetlify = loadBookings;
+
+// Re-sync when the visitor returns to the tab (e.g. switching Mac → iPhone,
+// or coming back after a few minutes) so freshly-made bookings show up.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') loadBookings();
+});
+window.addEventListener('focus', loadBookings);
 
 const UNAVAIL_TIMES = [];
 
@@ -944,7 +962,7 @@ function renderCalendar() {
     const thisDate = new Date(calYear, calMonth_, d);
     thisDate.setHours(0,0,0,0);
     const todayClean = new Date(); todayClean.setHours(0,0,0,0);
-    if (thisDate < OPEN_DATE) {
+    if (thisDate < minBookableDate()) {
       cell.classList.add('disabled');
     } else {
       if (thisDate.getTime() === todayClean.getTime()) cell.classList.add('today');
@@ -966,15 +984,25 @@ function renderTimeSlots() {
   const slots = ['08:00','09:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00','20:00','21:00'];
   const container = document.getElementById('timeSlots');
   container.innerHTML = '';
-  const dateKey = selectedDate ? selectedDate.toISOString().split('T')[0] : null;
+  const dateKey = selectedDate ? fmtDate(selectedDate) : null;
+
+  // If the selected day is today, work out the current hour so we can
+  // disable slots that have already started.
+  const now = new Date();
+  const todayKey = fmtDate(now);
+  const isToday = dateKey === todayKey;
+  const currentHour = now.getHours();
+
   slots.forEach(s => {
     const btn = document.createElement('div');
     btn.className = 'time-slot';
     btn.textContent = s;
+    const slotHour = parseInt(s.split(':')[0]);
     const booked = dateKey && isSlotBooked(dateKey, s);
-    if (booked) {
+    const past = isToday && slotHour <= currentHour;
+    if (booked || past) {
       btn.classList.add('unavail');
-      btn.title = 'Booked';
+      btn.title = past ? 'Past' : 'Booked';
     } else {
       if (selectedTime === s) btn.classList.add('selected');
       btn.onclick = () => { selectedTime = s; renderTimeSlots(); validateTimeWithDuration(); };
@@ -986,7 +1014,7 @@ function renderTimeSlots() {
 function validateTimeWithDuration() {
   // Check that all slots for selected duration are free
   if (!selectedDate || !selectedTime) return true;
-  const dateKey = selectedDate.toISOString().split('T')[0];
+  const dateKey = fmtDate(selectedDate);
   const [h] = selectedTime.split(':').map(Number);
   for (let i = 0; i < selectedDur; i++) {
     const slotHour = String(h + i).padStart(2,'0') + ':00';
@@ -1150,14 +1178,35 @@ async function submitBooking() {
   btn.disabled = true;
   btn.textContent = '⏳ Sending...';
 
-  const dateKey = selectedDate.toISOString().split('T')[0];
+  const dateKey = fmtDate(selectedDate);
   const dateStr = selectedDate.toLocaleDateString('en-GB');
   const courtCost = selectedDur * (selectedDur >= 4 ? 45 : 50);
   const racketCost = racketRented ? racketCount * 5 : 0;
   const total = courtCost + racketCost;
   const durLabel = selectedDur === 1 ? `1 ${t('hour')}` : `${selectedDur} ${t('hours')}`;
 
-  // ── Submit to Web3Forms (owner email + database) ──
+  // ── Save the booking to Supabase FIRST. This is the real, shared record. ──
+  // Re-sync once more in case another device booked this slot since page load.
+  await loadBookings();
+  if (!validateTimeWithDuration()) {
+    btn.disabled = false; btn.textContent = t('btn_confirm') || 'Confirm Reservation →';
+    const errEl = document.getElementById('bookingError');
+    errEl.textContent = 'Sorry, this slot was just booked. Please go back and select another time.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  const saved = await addBookedSlot(dateKey, selectedTime, selectedDur);
+  if (!saved) {
+    // The booking did NOT persist — never show a fake confirmation.
+    btn.disabled = false; btn.textContent = t('btn_confirm') || 'Confirm Reservation →';
+    const errEl = document.getElementById('bookingError');
+    errEl.textContent = 'We could not save your booking right now. Please try again, or contact us directly.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  // ── Notify the owner via Web3Forms ──
   try {
     const formData = {
       access_key: '57431a5d-1cd1-4115-bf6b-7e95d151efe3',
@@ -1209,8 +1258,6 @@ async function submitBooking() {
     console.warn('Customer email error:', err); // non-critical
   }
 
-  // Mark slot as booked locally
-  await addBookedSlot(dateKey, selectedTime, selectedDur);
 
   // Store booking name/phone for calendar display
   const namesStore = JSON.parse(localStorage.getItem('padel_names') || '{}');
