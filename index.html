@@ -867,6 +867,17 @@ function minBookableDate() {
 // which is exactly what made bookings look saved on the Mac but not the iPhone.
 let bookedSlotsCache = {};
 
+// Never let a Supabase call hang the UI forever (e.g. a paused / cold-starting
+// project). If it doesn't answer in `ms`, we reject and recover gracefully.
+function withTimeout(thenable, ms, label) {
+  return Promise.race([
+    Promise.resolve(thenable),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error((label || 'Supabase request') + ' timed out after ' + ms + 'ms')), ms)
+    )
+  ]);
+}
+
 function getBookedSlots() {
   return bookedSlotsCache;
 }
@@ -877,14 +888,18 @@ function isSlotBooked(dateStr, time) {
 
 // Write a confirmed booking to Supabase. Returns true only if it really saved.
 async function addBookedSlot(dateStr, time, dur) {
-  const { error } = await supabase.from('bookings').insert({
-    date_key:  dateStr,
-    time_slot: time,
-    duration:  dur
-  });
-  if (error) {
-    console.error('Supabase insert error:', error);
-    return false;          // caller must NOT show a confirmation
+  try {
+    const { error } = await withTimeout(
+      supabase.from('bookings').insert({ date_key: dateStr, time_slot: time, duration: dur }),
+      15000, 'Booking save'
+    );
+    if (error) {
+      console.error('Supabase insert error:', error);
+      return false;          // caller must NOT show a confirmation
+    }
+  } catch (e) {
+    console.error('Supabase insert failed:', e);
+    return false;            // timeout or network/connection failure
   }
   // Reflect immediately in the local cache so the UI updates at once
   const [h] = time.split(':').map(Number);
@@ -898,9 +913,10 @@ async function addBookedSlot(dateStr, time, dur) {
 async function loadBookings() {
   // Load all bookings from Supabase — this is what every device reads
   try {
-    const { data, error } = await supabase
-      .from('bookings')
-      .select('date_key, time_slot, duration');
+    const { data, error } = await withTimeout(
+      supabase.from('bookings').select('date_key, time_slot, duration'),
+      15000, 'Booking load'
+    );
     if (error) { console.error('Supabase load error:', error); return; }
     if (!data) return;
     const slots = {};
@@ -1186,22 +1202,13 @@ async function submitBooking() {
   const durLabel = selectedDur === 1 ? `1 ${t('hour')}` : `${selectedDur} ${t('hours')}`;
 
   // ── Save the booking to Supabase FIRST. This is the real, shared record. ──
-  // Re-sync once more in case another device booked this slot since page load.
-  await loadBookings();
-  if (!validateTimeWithDuration()) {
-    btn.disabled = false; btn.textContent = t('btn_confirm') || 'Confirm Reservation →';
-    const errEl = document.getElementById('bookingError');
-    errEl.textContent = 'Sorry, this slot was just booked. Please go back and select another time.';
-    errEl.style.display = 'block';
-    return;
-  }
-
+  // (addBookedSlot is time-bounded, so this can never hang the button forever.)
   const saved = await addBookedSlot(dateKey, selectedTime, selectedDur);
   if (!saved) {
     // The booking did NOT persist — never show a fake confirmation.
     btn.disabled = false; btn.textContent = t('btn_confirm') || 'Confirm Reservation →';
     const errEl = document.getElementById('bookingError');
-    errEl.textContent = 'We could not save your booking right now. Please try again, or contact us directly.';
+    errEl.textContent = 'We could not save your booking right now. Please check your connection and try again, or contact us directly.';
     errEl.style.display = 'block';
     return;
   }
