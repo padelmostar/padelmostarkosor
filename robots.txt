@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://padelmostar.github.io/padelmostarkosor/sitemap.xml
